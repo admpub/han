@@ -1,0 +1,183 @@
+/*
+
+   Copyright 2016 Wenhui Shen <www.webx.top>
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+*/
+package markdown
+
+import (
+	"fmt"
+	"io/ioutil"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	md2html "github.com/russross/blackfriday"
+	"github.com/admpub/han"
+)
+
+type (
+	Options struct {
+		Path               string   `json:"path"` //UrlPath
+		MarkdownExtensions []string `json:"markdownExtensions"`
+		Index              string   `json:"index"`
+		Root               string   `json:"root"`
+		Browse             bool     `json:"browse"`
+		Preprocessor       func(han.Context, []byte) []byte
+		Filter             func(string) bool // true: ok; false: ignore
+	}
+)
+
+func Markdown(options ...*Options) han.MiddlewareFunc {
+	// Default options
+	opts := new(Options)
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	if opts.Index == "" {
+		opts.Index = "SUMMARY.md"
+	}
+	if opts.MarkdownExtensions == nil {
+		opts.MarkdownExtensions = []string{`.md`, `.mdown`, `.markdown`}
+	}
+	opts.Root, _ = filepath.Abs(opts.Root)
+
+	if opts.Preprocessor == nil {
+		opts.Preprocessor = func(c han.Context, b []byte) []byte {
+			return b
+		}
+	}
+	if opts.Filter == nil {
+		opts.Filter = func(string) bool {
+			return true
+		}
+	}
+
+	length := len(opts.Path)
+
+	return func(next han.Handler) han.Handler {
+		return han.HandlerFunc(func(c han.Context) error {
+			file := c.Request().URL().Path()
+			if len(file) < length || file[0:length] != opts.Path {
+				return next.Handle(c)
+			}
+			if !opts.Filter(file) {
+				return next.Handle(c)
+			}
+			file = filepath.Clean(file[length:])
+			absFile := filepath.Join(opts.Root, file)
+			if !strings.HasPrefix(absFile, opts.Root) {
+				return next.Handle(c)
+			}
+			fi, err := os.Stat(absFile)
+			if err != nil {
+				return han.ErrNotFound
+			}
+			w := c.Response()
+			if fi.IsDir() {
+				// Index file
+				indexFile := filepath.Join(absFile, opts.Index)
+				fi, err = os.Stat(indexFile)
+				if err != nil || fi.IsDir() {
+					if opts.Browse {
+						fs := http.Dir(filepath.Dir(absFile))
+						d, err := fs.Open(filepath.Base(absFile))
+						if err != nil {
+							return han.ErrNotFound
+						}
+						defer d.Close()
+						dirs, err := d.Readdir(-1)
+						if err != nil {
+							return han.ErrNotFound
+						}
+
+						// Create a directory index
+						w.Header().Set(han.HeaderContentType, han.MIMETextHTMLCharsetUTF8)
+						if _, err = fmt.Fprintf(w, `<!doctype html>
+<html>
+    <head>
+        <meta charset="UTF-8">
+        <title>`+file+`</title>
+        <meta content="IE=edge,chrome=1" http-equiv="X-UA-Compatible" />
+        <meta content="width=device-width,initial-scale=1.0,minimum-scale=1.0,maximum-scale=1.0,user-scalable=no" name="viewport" />
+        <link href="/favicon.ico" rel="shortcut icon">
+    </head>
+    <body>`); err != nil {
+							return err
+						}
+						if _, err = fmt.Fprintf(w, "<ul id=\"fileList\">\n"); err != nil {
+							return err
+						}
+						for _, d := range dirs {
+							name := d.Name()
+							color := "#212121"
+							if d.IsDir() {
+								color = "#e91e63"
+								name += "/"
+							}
+							if !opts.Filter(name) {
+								continue
+							}
+							if _, err = fmt.Fprintf(w, "<li><a href=\"%s\" style=\"color: %s;\">%s</a></li>\n", name, color, name); err != nil {
+								return err
+							}
+						}
+						if _, err = fmt.Fprintf(w, "</ul>\n"); err != nil {
+							return err
+						}
+						_, err = fmt.Fprintf(w, "</body>\n</html>")
+						return err
+					}
+					return han.ErrNotFound
+				}
+				absFile = indexFile
+			}
+			ext := strings.ToLower(filepath.Ext(fi.Name()))
+			isMarkdownDocument := false
+			for _, vext := range opts.MarkdownExtensions {
+				if ext == vext {
+					isMarkdownDocument = true
+					break
+				}
+			}
+			if isMarkdownDocument {
+				modtime := fi.ModTime()
+				if t, err := time.Parse(http.TimeFormat, c.Request().Header().Get(han.HeaderIfModifiedSince)); err == nil && modtime.Before(t.Add(1*time.Second)) {
+					w.Header().Del(han.HeaderContentType)
+					w.Header().Del(han.HeaderContentLength)
+					return c.NoContent(http.StatusNotModified)
+				}
+				var b []byte
+				b, err = ioutil.ReadFile(absFile)
+				if err != nil {
+					return han.ErrNotFound
+				}
+				b = opts.Preprocessor(c, b)
+				b = md2html.MarkdownCommon(b)
+
+				w.Header().Set(han.HeaderContentType, han.MIMETextHTMLCharsetUTF8)
+				w.Header().Set(han.HeaderLastModified, modtime.UTC().Format(http.TimeFormat))
+				w.WriteHeader(http.StatusOK)
+				_, err = w.Write(b)
+			} else {
+				w.Header().Set(han.HeaderContentType, han.ContentTypeByExtension(ext))
+				w.ServeFile(absFile)
+			}
+			return err
+		})
+	}
+}
